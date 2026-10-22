@@ -1,0 +1,215 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+    :root {
+        --bg-dark: #0b0c10;
+        --bg-card: #151722;
+        --bg-card-hover: #1b1e2b;
+        --border-color: #26293b;
+        --border-color-hover: #3b3f58;
+        --text-main: #ffffff;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --accent-emerald: #10b981;
+    }
+
+    body {
+        font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+        background-color: var(--bg-dark);
+        color: var(--text-main);
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        overflow-x: hidden;
+    }
+
+    ::selection {
+        background: #ffffff;
+        color: #0b0c10;
+    }
+}
+
+@layer components {
+
+    /* GPU-accelerated dark panel — no more "transition: all" */
+    .dark-panel {
+        background-color: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: 1.25rem;
+        /* FIX: Only transition border-color, not all properties */
+        transition: border-color 0.2s ease;
+        /* FIX: Force GPU layer so scroll doesn't trigger layout */
+        transform: translateZ(0);
+        will-change: auto;
+    }
+
+    .dark-panel:hover {
+        border-color: var(--border-color-hover);
+    }
+
+    /* Solid White Primary Button — reduced shadow intensity */
+    .btn-solid-white {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.875rem 1.75rem;
+        border-radius: 0.875rem;
+        font-weight: 600;
+        font-size: 0.95rem;
+        background-color: #ffffff;
+        color: #0b0c10;
+        /* FIX: Reduced from 20px blur to 6px — massive scroll performance gain */
+        box-shadow: 0 2px 6px rgba(255, 255, 255, 0.06);
+        transition: background-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .btn-solid-white:hover {
+        background-color: #f1f5f9;
+        box-shadow: 0 4px 10px rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-solid-white:active {
+        transform: translateY(0);
+    }
+
+    /* Dark Slate Secondary Button */
+    .btn-slate-outline {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.875rem 1.75rem;
+        border-radius: 0.875rem;
+        font-weight: 600;
+        font-size: 0.95rem;
+        background-color: #151722;
+        color: #ffffff;
+        border: 1px solid var(--border-color);
+        transition: background-color 0.2s ease, border-color 0.2s ease;
+    }
+
+    .btn-slate-outline:hover {
+        background-color: #1d2030;
+        border-color: var(--border-color-hover);
+    }
+
+    /* Neutral Dark Input Fields */
+    .dark-input {
+        width: 100%;
+        padding: 0.875rem 1.25rem;
+        border-radius: 0.875rem;
+        background-color: #11131c;
+        border: 1px solid var(--border-color);
+        color: #ffffff;
+        font-size: 0.95rem;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .dark-input::placeholder {
+        color: #64748b;
+    }
+
+    .dark-input:focus {
+        outline: none;
+        background-color: #151824;
+        border-color: #475569;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06);
+    }
+
+    /* Category Filter Pills — reduced active shadow */
+    .dark-pill {
+        padding: 0.625rem 1.25rem;
+        border-radius: 9999px;
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #94a3b8;
+        background-color: #151722;
+        border: 1px solid var(--border-color);
+        transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+        cursor: pointer;
+    }
+
+    .dark-pill:hover {
+        color: #ffffff;
+        border-color: var(--border-color-hover);
+        background-color: #1b1e2b;
+    }
+
+    .dark-pill.active {
+        color: #0b0c10;
+        background-color: #ffffff;
+        border-color: #ffffff;
+        font-weight: 600;
+        /* FIX: Reduced from 15px blur to 4px */
+        box-shadow: 0 2px 4px rgba(255, 255, 255, 0.08);
+    }
+
+    /* Navigation Links */
+    .dark-nav-link {
+        padding: 0.5rem 0.875rem;
+        border-radius: 0.625rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #94a3b8;
+        transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    .dark-nav-link:hover {
+        color: #ffffff;
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+
+    .dark-nav-link.active {
+        color: #ffffff;
+        background-color: #1b1e2b;
+        border: 1px solid var(--border-color);
+    }
+}
+
+/* Browser Autofill Dark Overrides */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: #ffffff !important;
+    transition: background-color 5000s ease-in-out 0s;
+    box-shadow: inset 0 0 20px 20px #11131c !important;
+}
+
+@layer utilities {
+
+    /* 
+     * WARNING: bg-noise uses SVG feTurbulence which is CPU-intensive.
+     * If applied to a large container, it causes severe scroll lag.
+     * Only use on small elements, or remove entirely.
+     */
+    .bg-noise {
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.02'/%3E%3C/svg%3E");
+    }
+
+    /* GPU acceleration utility for scroll containers */
+    .gpu-layer {
+        transform: translateZ(0);
+        backface-visibility: hidden;
+    }
+}
+
+/* Custom Minimal Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #26293b;
+    border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+}

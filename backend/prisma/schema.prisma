@@ -1,0 +1,281 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  MEMBER
+  HOST
+  ADMIN
+}
+
+enum PoolStatus {
+  ACTIVE
+  FULL
+  CLOSED
+}
+
+enum PoolType {
+  PUBLIC
+  PRIVATE
+}
+
+enum MembershipStatus {
+  ACTIVE
+  IN_ESCROW
+  DISPUTED
+  CANCELLED
+  FAILED
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum TransactionType {
+  JOIN
+  RECURRING
+  PAYOUT
+  CARD_VERIFICATION
+}
+
+enum PayoutStatus {
+  PENDING
+  SCHEDULED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum DisputeStatus {
+  OPEN
+  RESOLVED
+}
+
+model User {
+  id                 String    @id @default(cuid())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  email              String    @unique
+  passwordHash       String
+  fullName           String
+  role               UserRole  @default(MEMBER)
+  emailVerified      Boolean   @default(false)
+  passwordResetToken String?
+  passwordResetExpires DateTime?
+
+  reputationScore    Int       @default(0) @map("reputation_score")
+  successfulPools    Int       @default(0) @map("successful_pools")
+  totalDisputes      Int       @default(0) @map("total_disputes")
+  totalMembersServed Int       @default(0) @map("total_members_served")
+  hostSince          DateTime? @map("host_since")
+
+  emailVerificationToken   String?   @map("email_verification_token")
+  emailVerificationExpires DateTime? @map("email_verification_expires")
+
+  pools              Pool[]
+  memberships        Membership[]
+  transactions       Transaction[]
+  payouts            Payout[]
+  disputes           Dispute[]    @relation("MemberDisputes")
+  resolvedDisputes   Dispute[]    @relation("DisputeResolver")
+  bankAccount        BankAccount?
+  notifications      Notification[]
+  paymentMethods     PaymentMethod[]
+}
+
+model Pool {
+  id                   String       @id @default(cuid())
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  hostId               String
+  name                 String
+  category             String
+  poolType             PoolType     @default(PUBLIC)
+  totalSeats           Int
+  pricePerSeat         Int
+  renewalDay           Int          @default(1)
+  encryptedCredentials String
+  status               PoolStatus   @default(ACTIVE)
+
+  host                 User         @relation(fields: [hostId], references: [id])
+  memberships          Membership[]
+
+  @@index([hostId])
+  @@index([status])
+}
+
+model Membership {
+  id              String           @id @default(cuid())
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  userId          String
+  poolId          String
+  status          MembershipStatus @default(IN_ESCROW)
+  escrowEndsAt    DateTime?
+  nextBillingDate DateTime?
+  paystackAuthCode String?
+
+  user            User             @relation(fields: [userId], references: [id])
+  pool            Pool             @relation(fields: [poolId], references: [id])
+  transactions    Transaction[]
+  disputes        Dispute[]
+
+  @@unique([userId, poolId])
+  @@index([userId])
+  @@index([poolId])
+  @@index([status, escrowEndsAt])
+  @@index([status, nextBillingDate])
+}
+
+model Transaction {
+  id            String            @id @default(cuid())
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  userId        String
+  reference     String            @unique
+  amount        Int
+  platformFee   Int
+  hostPayout    Int
+  status        TransactionStatus @default(PENDING)
+  type          TransactionType   @default(JOIN)
+  paystackData  Json?
+  membershipId  String?
+
+  user          User              @relation(fields: [userId], references: [id])
+  membership    Membership?       @relation(fields: [membershipId], references: [id])
+  payout        Payout?
+
+  @@index([userId])
+  @@index([membershipId])
+  @@index([status])
+}
+
+model Payout {
+  id            String      @id @default(cuid())
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  transactionId String      @unique
+  hostId        String
+  amount        Int
+  status        PayoutStatus @default(PENDING)
+  payoutDueAt   DateTime?
+  transferCode  String?
+  failureReason String?
+
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  host          User        @relation(fields: [hostId], references: [id])
+
+  @@index([hostId])
+  @@index([status, payoutDueAt])
+}
+
+model Dispute {
+  id           String       @id @default(cuid())
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  membershipId String
+  memberId     String
+  reason       String
+  status       DisputeStatus @default(OPEN)
+  resolution   String?
+  resolvedBy   String?
+  resolvedAt   DateTime?
+  adminNotes   String?
+
+  membership   Membership   @relation(fields: [membershipId], references: [id])
+  member       User         @relation("MemberDisputes", fields: [memberId], references: [id])
+  resolver     User?        @relation("DisputeResolver", fields: [resolvedBy], references: [id])
+  messages     DisputeMessage[]
+  evidence     DisputeEvidence[]
+
+  @@index([membershipId])
+  @@index([memberId])
+  @@index([status])
+}
+
+model DisputeMessage {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+  disputeId  String
+  senderId   String
+  senderRole String
+  message    String
+
+  dispute    Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+}
+
+model DisputeEvidence {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+  disputeId  String
+  uploadedBy String
+  role       String
+  fileUrl    String
+  fileName   String
+
+  dispute    Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+}
+
+model BankAccount {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  userId        String   @unique
+  bankCode      String
+  bankName      String
+  accountNumber String
+  accountName   String
+  recipientCode String
+  verified      Boolean  @default(false)
+
+  user          User     @relation(fields: [userId], references: [id])
+}
+
+model WebhookLog {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  reference String   @unique
+  event     String
+  processed Boolean  @default(false)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  read      Boolean  @default(false)
+  userId    String
+  type      String
+  title     String
+  message   String
+  data      Json?
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@index([type])
+}
+
+model PaymentMethod {
+  id                String   @id @default(cuid())
+  userId            String
+  authorizationCode String   @unique @map("authorization_code")
+  cardType          String   @map("card_type") // visa, mastercard, verve
+  last4             String
+  expMonth          String   @map("exp_month")
+  expYear           String   @map("exp_year")
+  bank              String?
+  brand             String?
+  isDefault         Boolean  @default(true) @map("is_default")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
