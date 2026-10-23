@@ -7,6 +7,7 @@ import {
     sendPaymentFailedEmail,
 } from '../utils/email.js';
 import { createNotification } from '../utils/notifications.js';
+import { schedulePayoutForMembership } from '../utils/transactions.js';
 
 const PLATFORM_FEE_PERCENT = 0.20;
 const MAX_RETRIES = 3;
@@ -52,17 +53,7 @@ export async function processExpiredEscrows() {
 
             // Natural escrow period has already elapsed; payout is due immediately
             const payoutDueAt = new Date();
-            const transaction = await prisma.transaction.findFirst({
-                where: { membershipId: m.id, status: 'SUCCESS' },
-                include: { payout: true },
-            });
-
-            if (transaction && transaction.payout) {
-                await prisma.payout.update({
-                    where: { id: transaction.payout.id },
-                    data: { status: 'SCHEDULED', payoutDueAt },
-                });
-            }
+            await schedulePayoutForMembership(m.id, payoutDueAt);
         }
 
         if (memberships.length > 0) {

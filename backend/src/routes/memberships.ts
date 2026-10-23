@@ -14,6 +14,7 @@ import { initiateTransfer } from '../utils/paystack.js';
 import { decrypt } from '../utils/encryption.js';
 import { sendCredentialsEmail, sendDisputeOpenedEmail } from '../utils/email.js';
 import { recalculateHostReputation } from '../utils/reputation.js';
+import { getCurrentJoinTransaction, schedulePayoutForMembership } from '../utils/transactions.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -250,21 +251,7 @@ router.post('/:id/confirm', authMiddleware, validate({ params: idParamSchema }),
 
     // Member explicitly verified and confirmed access; release host payout immediately
     const payoutDueAt = new Date();
-
-    const transaction = await prisma.transaction.findFirst({
-      where: { membershipId: membership.id, status: 'SUCCESS' },
-      include: { payout: true },
-    });
-
-    if (transaction && transaction.payout) {
-      await prisma.payout.update({
-        where: { id: transaction.payout.id },
-        data: {
-          status: 'SCHEDULED',
-          payoutDueAt,
-        },
-      });
-    }
+    await schedulePayoutForMembership(membership.id, payoutDueAt);
 
     res.json({
       success: true,
@@ -432,10 +419,7 @@ router.post('/:id/report-broken', authMiddleware, validate({ params: idParamSche
       },
     });
 
-    const transaction = await prisma.transaction.findFirst({
-      where: { membershipId: membership.id },
-      include: { payout: true },
-    });
+    const transaction = await getCurrentJoinTransaction(membership.id);
 
     if (transaction?.payout?.status === 'PROCESSING') {
       console.warn(`URGENT: Payout for ${membership.id} already sent. Manual reversal needed.`);

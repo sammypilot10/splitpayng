@@ -11,6 +11,7 @@ import {
 import { refundTransaction } from '../utils/paystack.js';
 import { sendDisputeResolvedEmail } from '../utils/email.js';
 import { recalculateHostReputation } from '../utils/reputation.js';
+import { getCurrentJoinTransaction, schedulePayoutForMembership } from '../utils/transactions.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -123,13 +124,9 @@ router.get('/disputes/:id/timeline', authMiddleware, roleMiddleware('ADMIN'), as
       return;
     }
 
-    const transaction = await prisma.transaction.findFirst({
-      where: { membershipId: dispute.membershipId, status: 'SUCCESS' },
-    });
+    const transaction = await getCurrentJoinTransaction(dispute.membershipId);
 
-    const payout = transaction ? await prisma.payout.findUnique({
-      where: { transactionId: transaction.id },
-    }) : null;
+    const payout = transaction?.payout ?? null;
 
     const events = [
       {
@@ -304,9 +301,7 @@ router.post(
       }
 
       const membership = dispute.membership;
-      const transaction = await prisma.transaction.findFirst({
-        where: { membershipId: membership.id, status: 'SUCCESS' },
-      });
+      const transaction = await getCurrentJoinTransaction(membership.id);
 
       // ─── REFUND PATH ─────────────────────────────────────────────────────
 
@@ -451,21 +446,8 @@ router.post(
           });
 
           // Schedule payout (don't transfer immediately — let cron handle it)
-          if (transaction) {
-            const payout = await tx.payout.findUnique({
-              where: { transactionId: transaction.id },
-            });
-
-            if (payout && (payout.status === 'PENDING' || payout.status === 'FAILED')) {
-              await tx.payout.update({
-                where: { id: payout.id },
-                data: {
-                  status: 'SCHEDULED',
-                  payoutDueAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
-                },
-              });
-            }
-          }
+          const dueAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+          await schedulePayoutForMembership(membership.id, dueAt, tx);
         });
 
         // 2. Side effects
