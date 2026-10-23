@@ -8,10 +8,10 @@ import {
   adminNotesSchema,
   resolveDisputeSchema,
 } from '../validation/index.js';
-import { refundTransaction } from '../utils/paystack.js';
+import { refundTransaction, verifyTransfer } from '../utils/paystack.js';
 import { sendDisputeResolvedEmail } from '../utils/email.js';
 import { recalculateHostReputation } from '../utils/reputation.js';
-import { getCurrentJoinTransaction, schedulePayoutForMembership } from '../utils/transactions.js';
+import { getCurrentJoinTransaction, schedulePayoutForMembership, completePayout } from '../utils/transactions.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -494,6 +494,114 @@ router.post(
 
       // Fallback
       res.status(400).json({ success: false, message: 'Invalid action' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ─── REQUEUE FAILED PAYOUT ────────────────────────────────────────────────
+router.post(
+  '/payouts/:id/requeue',
+  authMiddleware,
+  roleMiddleware('ADMIN'),
+  validate({ params: idParamSchema }),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const { id } = req.params;
+
+      const payout = await prisma.payout.findUnique({
+        where: { id },
+        include: { transaction: true },
+      });
+
+      if (!payout) {
+        res.status(404).json({ success: false, message: 'Payout not found' });
+        return;
+      }
+
+      // Refuse to requeue payouts whose transaction is REFUNDED or failureReason indicates dispute refund
+      const isDisputeRefund =
+        payout.transaction?.status === 'REFUNDED' ||
+        payout.failureReason?.toLowerCase().includes('dispute') ||
+        payout.failureReason?.toLowerCase().includes('refund');
+
+      if (isDisputeRefund) {
+        res.status(400).json({
+          success: false,
+          message: 'Cannot requeue payout: transaction has been refunded or disputed.',
+        });
+        return;
+      }
+
+      if (payout.status === 'COMPLETED') {
+        res.status(409).json({ success: false, message: 'Payout has already completed' });
+        return;
+      }
+
+      // Requeue only if verifyTransfer returns 404 or an explicit failed/reversed status.
+      // On any other verify error return 502 and leave the payout untouched.
+      // Return 409 for "already succeeded, marked COMPLETED".
+      if (payout.transferCode) {
+        try {
+          const transfer = await verifyTransfer(payout.transferCode);
+          const status = (transfer?.status || '').toLowerCase();
+          if (status === 'success') {
+            await completePayout(payout.id, prisma);
+            res.status(409).json({
+              success: false,
+              message: 'Transfer already succeeded on Paystack. Payout marked COMPLETED.',
+            });
+            return;
+          }
+
+          if (status !== 'failed' && status !== 'reversed') {
+            res.status(400).json({
+              success: false,
+              message: `Cannot requeue: Paystack transfer is currently '${status}'. Payout remains untouched.`,
+            });
+            return;
+          }
+        } catch (err: any) {
+          const is404 = err.status === 404 || err.message?.toLowerCase().includes('not found');
+          if (!is404) {
+            res.status(502).json({
+              success: false,
+              message: `Could not verify transfer status on Paystack: ${err.message}. Payout remains untouched.`,
+            });
+            return;
+          }
+        }
+      }
+
+      // Conditional update: only requeue if currently FAILED
+      const result = await prisma.payout.updateMany({
+        where: {
+          id,
+          status: 'FAILED',
+        },
+        data: {
+          status: 'SCHEDULED',
+          payoutDueAt: new Date(),
+          attempts: 0,
+          firstAttemptAt: null,
+          failureReason: null,
+          transferCode: null,
+        },
+      });
+
+      if (result.count === 0) {
+        res.status(400).json({
+          success: false,
+          message: 'Only FAILED payouts can be requeued',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: 'Payout requeued successfully',
+      });
     } catch (error) {
       next(error);
     }

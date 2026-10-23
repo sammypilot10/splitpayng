@@ -1,5 +1,11 @@
+import { randomUUID } from 'crypto';
 import { prisma } from '../db.js';
-import { initiateTransfer, chargeAuthorization } from '../utils/paystack.js';
+import {
+    initiateTransfer,
+    chargeAuthorization,
+    verifyTransfer,
+    classifyPaystackError,
+} from '../utils/paystack.js';
 import {
     sendEscrowReminderEmail,
     sendPayoutConfirmedEmail,
@@ -7,17 +13,33 @@ import {
     sendPaymentFailedEmail,
 } from '../utils/email.js';
 import { createNotification } from '../utils/notifications.js';
-import { schedulePayoutForMembership } from '../utils/transactions.js';
+import { schedulePayoutForMembership, completePayout } from '../utils/transactions.js';
 
 const PLATFORM_FEE_PERCENT = 0.20;
+export const loggedOtpPayoutIds = new Set<string>();
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
+
+function isPrismaConnectionError(err: any): boolean {
+    if (!err) return false;
+    const code = err.code;
+    if (code === 'P1001' || code === 'P1002' || code === 'P1017') return true;
+    const msg = err.message || '';
+    if (msg.includes("Can't reach database server") || msg.includes('Connection lost') || msg.includes('connection timed out')) {
+        return true;
+    }
+    return false;
+}
 
 async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T | null> {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
             return await fn();
         } catch (err: any) {
+            if (!isPrismaConnectionError(err)) {
+                console.error(`[Cron] ${label} encountered non-retryable error: ${err.message}`);
+                throw err;
+            }
             const isLast = attempt === MAX_RETRIES;
             const msg = err.message?.includes("Can't reach database server")
                 ? "Database connection lost (Neon idle timeout)"
@@ -207,62 +229,166 @@ export async function processScheduledPayouts() {
 
             const bankAccount = payout.host.bankAccount;
             if (!bankAccount || !bankAccount.verified) {
-                await prisma.payout.update({
-                    where: { id: payout.id },
+                const failResult = await prisma.payout.updateMany({
+                    where: { id: payout.id, status: 'SCHEDULED' },
                     data: { status: 'FAILED', failureReason: 'No verified bank account' },
                 });
 
-                await createNotification({
-                    userId: payout.hostId,
-                    type: 'BANK_ACCOUNT_REQUIRED',
-                    title: 'Bank account required for payout',
-                    message: `You have a payout of ₦${payout.amount.toLocaleString()} ready, but have not linked a verified bank account. Please visit Payout Setup to receive your funds.`,
-                    data: { payoutId: payout.id, amount: payout.amount },
-                });
+                if (failResult.count === 1) {
+                    await createNotification({
+                        userId: payout.hostId,
+                        type: 'BANK_ACCOUNT_REQUIRED',
+                        title: 'Bank account required for payout',
+                        message: `You have a payout of ₦${payout.amount.toLocaleString()} ready, but have not linked a verified bank account. Please visit Payout Setup to receive your funds.`,
+                        data: { payoutId: payout.id, amount: payout.amount },
+                    });
+                }
                 continue;
             }
 
+            // Claim first atomically: generate ref and persist before calling Paystack
+            const transferRef = payout.transferCode || `TRF-${Date.now()}-${randomUUID()}`;
+            const claim = await prisma.payout.updateMany({
+                where: { id: payout.id, status: 'SCHEDULED' },
+                data: { status: 'PROCESSING', transferCode: transferRef },
+            });
+
+            if (claim.count !== 1) {
+                continue; // Already claimed or processed concurrently
+            }
+
             try {
-                const transferRef = `TRF-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
                 await initiateTransfer(
                     payout.amount,
                     bankAccount.recipientCode,
                     `Payout for pool subscription`,
                     transferRef
                 );
-                await prisma.payout.update({
-                    where: { id: payout.id },
-                    data: { status: 'PROCESSING', transferCode: transferRef },
-                });
+                // Note: Do NOT notify here. Payout is in PROCESSING.
+                // Notifications and emails are dispatched only on COMPLETED (via webhook or reconciliation).
+            } catch (err: any) {
+                const classification = classifyPaystackError(err);
+                console.error(`[Payout] Transfer error for payout ${payout.id} (${classification}):`, err.message);
 
-                const membership = await prisma.membership.findUnique({
-                    where: { id: payout.transaction.membershipId! },
-                    include: { pool: true },
-                });
+                if (classification === 'DUPLICATE_REFERENCE') {
+                    console.warn(`[Payout] Duplicate reference detected for payout ${payout.id} (${transferRef}). Verifying with Paystack...`);
+                    try {
+                        const transfer = await verifyTransfer(transferRef);
+                        const status = (transfer?.status || '').toLowerCase();
+                        if (status === 'success') {
+                            await completePayout(payout.id, prisma);
+                        } else if (status === 'failed' || status === 'reversed') {
+                            const reason = transfer?.failure_reason || transfer?.reason || 'Transfer failed or reversed by bank';
+                            await prisma.payout.updateMany({
+                                where: { id: payout.id, status: 'PROCESSING' },
+                                data: { status: 'FAILED', failureReason: reason, transferCode: null },
+                            });
+                        } else {
+                            console.log(`[Payout] Duplicate reference transfer ${transferRef} is currently '${status}'. Leaving in PROCESSING.`);
+                        }
+                    } catch (verifyErr: any) {
+                        console.warn(`[Payout] Could not verify duplicate reference ${transferRef}: ${verifyErr.message}. Leaving in PROCESSING.`);
+                    }
+                } else if (classification === 'DEFINITELY_NOT_CREATED') {
+                    const now = Date.now();
+                    const firstAttempt = payout.firstAttemptAt ? payout.firstAttemptAt.getTime() : now;
+                    const elapsedMs = now - firstAttempt;
+                    const FOUR_DAYS_MS = 4 * 24 * 60 * 60 * 1000;
 
-                if (membership) {
-                    await sendPayoutConfirmedEmail(
-                        payout.host.email,
-                        payout.host.fullName,
-                        membership.pool.name,
-                        payout.amount
-                    );
+                    if (elapsedMs >= FOUR_DAYS_MS) {
+                        await prisma.payout.updateMany({
+                            where: { id: payout.id, status: 'PROCESSING', transferCode: transferRef },
+                            data: {
+                                status: 'FAILED',
+                                failureReason: `Payout transfer window expired after 4 days of retries: ${err.message}`,
+                                transferCode: null,
+                            },
+                        });
 
-                    await prisma.notification.create({
+                        // Notify admin at final failure
+                        try {
+                            const admins = await prisma.user.findMany({
+                                where: { role: 'ADMIN' },
+                                select: { id: true },
+                            });
+                            for (const admin of admins) {
+                                await createNotification({
+                                    userId: admin.id,
+                                    type: 'ADMIN_PAYOUT_FAILED',
+                                    title: 'Payout Failed - Retry Window Expired (4 Days)',
+                                    message: `Payout ${payout.id} (₦${payout.amount.toLocaleString()}) for host ${payout.hostId} failed after 4 days: ${err.message}`,
+                                    data: { payoutId: payout.id, hostId: payout.hostId, amount: payout.amount, error: err.message },
+                                });
+                            }
+                        } catch (notifyErr: any) {
+                            console.error('[Payout] Error notifying admins of expired payout:', notifyErr.message);
+                        }
+                    } else {
+                        const newAttempts = (payout.attempts || 0) + 1;
+                        // Exponential backoff up to ~6 hours (360 minutes)
+                        const backoffMinutes = Math.min(360, Math.pow(2, Math.min(newAttempts, 6)) * 5);
+                        const nextDueAt = new Date(now + backoffMinutes * 60 * 1000);
+
+                        await prisma.payout.updateMany({
+                            where: { id: payout.id, status: 'PROCESSING', transferCode: transferRef },
+                            data: {
+                                status: 'SCHEDULED',
+                                payoutDueAt: nextDueAt,
+                                attempts: { increment: 1 },
+                                firstAttemptAt: payout.firstAttemptAt || new Date(firstAttempt),
+                            },
+                        });
+
+                        // Global 24h throttle for shortfall alert + stop payout loop for this run
+                        const msgLower = (err.message || '').toLowerCase();
+                        const isShortfall = msgLower.includes('balance');
+                        if (isShortfall) {
+                            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+                            const twentyFourHoursAgo = new Date(now - ONE_DAY_MS);
+                            const existingAlert = await prisma.notification.findFirst({
+                                where: {
+                                    type: 'ADMIN_BALANCE_SHORTFALL',
+                                    createdAt: { gte: twentyFourHoursAgo },
+                                },
+                            });
+
+                            if (!existingAlert) {
+                                try {
+                                    const admins = await prisma.user.findMany({
+                                        where: { role: 'ADMIN' },
+                                        select: { id: true },
+                                    });
+                                    for (const admin of admins) {
+                                        await createNotification({
+                                            userId: admin.id,
+                                            type: 'ADMIN_BALANCE_SHORTFALL',
+                                            title: 'Paystack Balance Shortfall',
+                                            message: `Insufficient balance to disburse payout ${payout.id} (₦${payout.amount.toLocaleString()}). Please fund your Paystack balance.`,
+                                            data: { payoutId: payout.id, amount: payout.amount, error: err.message },
+                                        });
+                                    }
+                                } catch (alertErr: any) {
+                                    console.error('[Payout] Error alerting admin of balance shortfall:', alertErr.message);
+                                }
+                            }
+
+                            console.warn(`[Payout] Balance shortfall detected on payout ${payout.id}. Stopping payout loop for this run.`);
+                            break;
+                        }
+                    }
+                } else if (classification === 'PERMANENT') {
+                    await prisma.payout.updateMany({
+                        where: { id: payout.id, status: 'PROCESSING', transferCode: transferRef },
                         data: {
-                            userId: payout.hostId,
-                            type: 'PAYOUT_CONFIRMED',
-                            title: 'Payout confirmed',
-                            message: `₦${payout.amount.toLocaleString()} has been sent to your bank account for "${membership.pool.name}".`,
-                            data: { payoutId: payout.id, poolName: membership.pool.name },
+                            status: 'FAILED',
+                            failureReason: err.message,
+                            transferCode: null,
                         },
                     });
+                } else {
+                    // POSSIBLY_CREATED (5xx, 408, timeout, network error): Leave in PROCESSING!
+                    console.warn(`[Payout] Payout ${payout.id} left in PROCESSING due to possibly-created error: ${err.message}. Reconcile will verify.`);
                 }
-            } catch (err: any) {
-                await prisma.payout.update({
-                    where: { id: payout.id },
-                    data: { status: 'FAILED', failureReason: err.message },
-                });
             }
         }
 
@@ -270,6 +396,62 @@ export async function processScheduledPayouts() {
             console.log(`[Cron] Processed ${payouts.length} scheduled payouts`);
         }
     }, 'Scheduled payouts');
+}
+
+export async function reconcilePendingTransfers() {
+    await withRetry(async () => {
+        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+        const pendingPayouts = await prisma.payout.findMany({
+            where: {
+                status: 'PROCESSING',
+                transferCode: { not: null },
+                updatedAt: { lte: fifteenMinutesAgo },
+            },
+            include: {
+                host: true,
+                transaction: true,
+            },
+        });
+
+        for (const payout of pendingPayouts) {
+            const ref = payout.transferCode!;
+            try {
+                const transfer = await verifyTransfer(ref);
+                const status = (transfer?.status || '').toLowerCase();
+
+                if (status === 'success') {
+                    await completePayout(payout.id, prisma);
+                } else if (status === 'failed' || status === 'reversed') {
+                    const reason = transfer?.failure_reason || transfer?.reason || 'Transfer failed or reversed by bank';
+                    await prisma.payout.updateMany({
+                        where: { id: payout.id, status: 'PROCESSING' },
+                        data: { status: 'FAILED', failureReason: reason, transferCode: null },
+                    });
+                } else if (status === 'otp') {
+                    if (!loggedOtpPayoutIds.has(payout.id)) {
+                        loggedOtpPayoutIds.add(payout.id);
+                        console.error(`[Payout] CRITICAL: Paystack transfer requires OTP! Ref: ${ref}. Payout ${payout.id} stays PROCESSING.`);
+                    }
+                } else {
+                    console.log(`[Reconcile] Transfer ${ref} is currently '${status}' on Paystack. Leaving in PROCESSING.`);
+                }
+            } catch (err: any) {
+                if (err.status === 404 || err.message?.toLowerCase().includes('not found')) {
+                    console.warn(`[Reconcile] Transfer ${ref} not found on Paystack (404). Returning payout ${payout.id} to SCHEDULED.`);
+                    await prisma.payout.updateMany({
+                        where: { id: payout.id, status: 'PROCESSING' },
+                        data: { status: 'SCHEDULED' },
+                    });
+                } else {
+                    console.warn(`[Reconcile] Network/transient error verifying transfer ${ref}: ${err.message}. Leaving in PROCESSING.`);
+                }
+            }
+        }
+
+        if (pendingPayouts.length > 0) {
+            console.log(`[Cron] Reconciled ${pendingPayouts.length} pending payouts`);
+        }
+    }, 'Reconcile pending transfers');
 }
 
 export async function processRecurringBilling() {

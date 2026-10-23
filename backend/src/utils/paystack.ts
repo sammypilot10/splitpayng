@@ -1,6 +1,67 @@
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || '';
 const BASE_URL = 'https://api.paystack.co';
 
+export class PaystackError extends Error {
+  status?: number;
+  data?: any;
+
+  constructor(message: string, status?: number, data?: any) {
+    super(message);
+    this.name = 'PaystackError';
+    this.status = status;
+    this.data = data;
+  }
+}
+
+export type PaystackErrorClassification =
+  | 'DEFINITELY_NOT_CREATED'
+  | 'POSSIBLY_CREATED'
+  | 'DUPLICATE_REFERENCE'
+  | 'PERMANENT';
+
+export function classifyPaystackError(err: any): PaystackErrorClassification {
+  if (!err) return 'POSSIBLY_CREATED';
+  const status = err.status;
+  const msg = (err.message || '').toLowerCase();
+
+  // Duplicate transfer reference on Paystack
+  if (
+    msg.includes('duplicate') ||
+    msg.includes('already been initiated') ||
+    msg.includes('reference has already been used')
+  ) {
+    return 'DUPLICATE_REFERENCE';
+  }
+
+  // Definitely not created: Paystack balance shortfall or rate limits
+  if (
+    msg.includes('balance') ||
+    status === 429
+  ) {
+    return 'DEFINITELY_NOT_CREATED';
+  }
+
+  // Possibly created: Server errors, timeouts, or network drops
+  if (
+    status === 408 ||
+    (status >= 500 && status < 600) ||
+    msg.includes('timeout') ||
+    msg.includes('etimedout') ||
+    msg.includes('econnreset') ||
+    msg.includes('network') ||
+    msg.includes('fetch failed')
+  ) {
+    return 'POSSIBLY_CREATED';
+  }
+
+  // Definite 4xx rejections (e.g. invalid recipient, recipient disabled, etc.)
+  if (status && status >= 400 && status < 500) {
+    return 'PERMANENT';
+  }
+
+  return 'POSSIBLY_CREATED';
+}
+
 async function paystackRequest(endpoint: string, options: RequestInit = {}) {
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     ...options,
@@ -11,9 +72,15 @@ async function paystackRequest(endpoint: string, options: RequestInit = {}) {
     },
   });
 
-  const data = await res.json();
-  if (!data.status) {
-    throw new Error(data.message || 'Paystack API error');
+  let data: any;
+  try {
+    data = await res.json();
+  } catch {
+    throw new PaystackError(res.statusText || 'Failed to parse Paystack response', res.status);
+  }
+
+  if (!res.ok || !data.status) {
+    throw new PaystackError(data.message || 'Paystack API error', res.status, data);
   }
   return data;
 }
@@ -73,6 +140,11 @@ export async function initiateTransfer(amount: number, recipientCode: string, re
       reference,
     }),
   });
+  return data.data;
+}
+
+export async function verifyTransfer(reference: string) {
+  const data = await paystackRequest(`/transfer/verify/${encodeURIComponent(reference)}`);
   return data.data;
 }
 

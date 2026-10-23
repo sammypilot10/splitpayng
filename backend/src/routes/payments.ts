@@ -7,6 +7,7 @@ import { initializeTransaction, verifyTransaction, chargeAuthorization, refundTr
 import { recalculateHostReputation } from '../utils/reputation.js';
 import { sendPaymentSuccessEmail, sendPoolFilledEmail, sendNewMemberEmail } from '../utils/email.js';
 import { createNotification } from '../utils/notifications.js';
+import { completePayout } from '../utils/transactions.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -222,20 +223,8 @@ router.post('/webhook', async (req, res, next) => {
         include: { host: true, transaction: { include: { membership: { include: { pool: true } } } } },
       });
 
-      if (payout && payout.status !== 'COMPLETED') {
-        await prisma.payout.update({
-          where: { id: payout.id },
-          data: { status: 'COMPLETED' },
-        });
-
-        const poolName = payout.transaction?.membership?.pool?.name || 'Subscription Pool';
-        await createNotification({
-          userId: payout.hostId,
-          type: 'PAYOUT_COMPLETED',
-          title: 'Payout disbursed successfully',
-          message: `₦${payout.amount.toLocaleString()} has been credited to your bank account for "${poolName}".`,
-          data: { payoutId: payout.id, amount: payout.amount },
-        });
+      if (payout) {
+        await completePayout(payout.id, prisma);
       }
     } else if (event.event === 'transfer.failed' || event.event === 'transfer.reversed') {
       const transferRef = event.data?.reference;
@@ -253,19 +242,21 @@ router.post('/webhook', async (req, res, next) => {
       });
 
       if (payout) {
-        await prisma.payout.update({
-          where: { id: payout.id },
-          data: { status: 'FAILED', failureReason: reason },
+        const updateResult = await prisma.payout.updateMany({
+          where: { id: payout.id, status: 'PROCESSING' },
+          data: { status: 'FAILED', failureReason: reason, transferCode: null },
         });
 
-        const poolName = payout.transaction?.membership?.pool?.name || 'Subscription Pool';
-        await createNotification({
-          userId: payout.hostId,
-          type: 'PAYOUT_FAILED',
-          title: 'Payout transfer failed',
-          message: `Transfer of ₦${payout.amount.toLocaleString()} for "${poolName}" could not be completed: ${reason}. Please verify your bank details in Payout Setup.`,
-          data: { payoutId: payout.id, amount: payout.amount, reason },
-        });
+        if (updateResult.count === 1) {
+          const poolName = payout.transaction?.membership?.pool?.name || 'Subscription Pool';
+          await createNotification({
+            userId: payout.hostId,
+            type: 'PAYOUT_FAILED',
+            title: 'Payout transfer failed',
+            message: `Transfer of ₦${payout.amount.toLocaleString()} for "${poolName}" could not be completed: ${reason}. Please verify your bank details in Payout Setup.`,
+            data: { payoutId: payout.id, amount: payout.amount, reason },
+          });
+        }
       }
     }
     res.status(200).send('OK');

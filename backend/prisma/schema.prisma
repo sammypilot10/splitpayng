@@ -169,6 +169,9 @@ model Payout {
   payoutDueAt   DateTime?
   transferCode  String?
   failureReason String?
+  attempts              Int          @default(0)
+  firstAttemptAt        DateTime?
+  lastShortfallAlertAt  DateTime?
 
   transaction   Transaction @relation(fields: [transactionId], references: [id])
   host          User        @relation(fields: [hostId], references: [id])

@@ -45,3 +45,73 @@ export async function schedulePayoutForMembership(membershipId: string, dueAt: D
 
   return { scheduled: result.count === 1, payoutId: transaction.payout.id };
 }
+
+/**
+ * Atomically transitions a payout to COMPLETED from PROCESSING, SCHEDULED, or FAILED.
+ * Dispatches confirmation email and notification only if this invocation performed the transition (count === 1).
+ */
+export async function completePayout(payoutId: string, client: any = prisma) {
+  const updateResult = await client.payout.updateMany({
+    where: {
+      id: payoutId,
+      status: { in: ['PROCESSING', 'SCHEDULED', 'FAILED'] },
+    },
+    data: {
+      status: 'COMPLETED',
+      failureReason: null,
+    },
+  });
+
+  if (updateResult.count === 1) {
+    try {
+      const payout = await client.payout.findUnique({
+        where: { id: payoutId },
+        include: {
+          host: true,
+          transaction: {
+            include: {
+              membership: {
+                include: { pool: true },
+              },
+            },
+          },
+        },
+      });
+
+      if (payout) {
+        const poolName = payout.transaction?.membership?.pool?.name || 'Subscription Pool';
+
+        try {
+          const { sendPayoutConfirmedEmail } = await import('./email.js');
+          await sendPayoutConfirmedEmail(
+            payout.host.email,
+            payout.host.fullName,
+            poolName,
+            payout.amount
+          );
+        } catch (emailErr: any) {
+          console.error(`[Payout] Email delivery error for payout ${payoutId}:`, emailErr.message);
+        }
+
+        try {
+          await client.notification.create({
+            data: {
+              userId: payout.hostId,
+              type: 'PAYOUT_CONFIRMED',
+              title: 'Payout confirmed',
+              message: `₦${payout.amount.toLocaleString()} has been sent to your bank account for "${poolName}".`,
+              data: { payoutId: payout.id, poolName },
+            },
+          });
+        } catch (notifErr: any) {
+          console.error(`[Payout] Notification error for payout ${payoutId}:`, notifErr.message);
+        }
+      }
+    } catch (fetchErr: any) {
+      console.error(`[Payout] Error loading details after completing payout ${payoutId}:`, fetchErr.message);
+    }
+    return { completed: true };
+  }
+  return { completed: false };
+}
+
