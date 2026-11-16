@@ -50,13 +50,15 @@ async function connectWithRetry() {
     }
 }
 
-connectWithRetry();
+if (process.env.NODE_ENV !== 'test') {
+    connectWithRetry();
 
-// Keep-alive ping every 3 minutes to prevent Neon from sleeping
-setInterval(async () => {
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-    } catch (err: any) {
-        console.warn(`[DB] Keep-alive ping failed: ${err.message}`);
-    }
-}, 3 * 60 * 1000);
+    // Keep-alive ping every 3 minutes to prevent Neon from sleeping
+    setInterval(async () => {
+        try {
+            await prisma.$queryRaw`SELECT 1`;
+        } catch (err: any) {
+            console.warn(`[DB] Keep-alive ping failed: ${err.message}`);
+        }
+    }, 3 * 60 * 1000);
+}

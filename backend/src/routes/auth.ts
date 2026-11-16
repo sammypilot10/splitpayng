@@ -18,7 +18,7 @@ import {
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET as string;
+const getJwtSecret = () => process.env.JWT_SECRET as string;
 const isProd = process.env.NODE_ENV === 'production';
 
 const COOKIE_OPTIONS = {
@@ -88,7 +88,7 @@ router.post('/register', validate({ body: registerSchema }), async (req, res, ne
 
     const token = jwt.sign(
       { userId: user.id, role: user.role, email: user.email },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: '7d' }
     );
     res.cookie('token', token, COOKIE_OPTIONS);
@@ -118,7 +118,7 @@ router.post('/login', validate({ body: loginSchema }), async (req, res, next) =>
     }
     const token = jwt.sign(
       { userId: user.id, role: user.role, email: user.email },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: '7d' }
     );
     res.cookie('token', token, COOKIE_OPTIONS);
@@ -223,7 +223,7 @@ router.post('/magic-link', validate({ body: magicLinkSchema }), async (req, res,
     }
     const token = jwt.sign(
       { userId: user.id, type: 'magic' },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: '15m' }
     );
     const link = `${process.env.FRONTEND_URL}/auth/verify-magic-link?token=${token}`;
@@ -237,7 +237,7 @@ router.post('/magic-link', validate({ body: magicLinkSchema }), async (req, res,
 router.post('/verify-magic-link', validate({ body: verifyMagicLinkSchema }), async (req, res, next) => {
   try {
     const { token } = req.body;
-    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; type: string };
+    const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; type: string };
     if (decoded.type !== 'magic') {
       res.status(400).json({ success: false, message: 'Invalid token type' });
       return;
@@ -249,7 +249,7 @@ router.post('/verify-magic-link', validate({ body: verifyMagicLinkSchema }), asy
     }
     const authToken = jwt.sign(
       { userId: user.id, role: user.role, email: user.email },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: '7d' }
     );
     res.cookie('token', authToken, COOKIE_OPTIONS);
@@ -347,7 +347,7 @@ router.get('/me', async (req, res) => {
       res.status(401).json({ success: false, message: 'Not authenticated' });
       return;
     }
-    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; role: string; email: string };
+    const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; role: string; email: string };
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
       select: USER_SELECT,

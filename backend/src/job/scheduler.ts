@@ -71,19 +71,21 @@ async function runJobs() {
     isRunning = false;
 }
 
-// Run every 5 minutes
-setInterval(runJobs, 5 * 60 * 1000);
+if (process.env.NODE_ENV !== 'test') {
+    // Run every 5 minutes
+    setInterval(runJobs, 5 * 60 * 1000);
 
-// Keep-alive ping loop: runs every 3 minutes to prevent idle connection termination
-setInterval(async () => {
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-    } catch (err: any) {
-        console.warn('[DB Ping] Keep-alive ping failed:', err.message);
-    }
-}, 3 * 60 * 1000);
+    // Keep-alive ping loop: runs every 3 minutes to prevent idle connection termination
+    setInterval(async () => {
+        try {
+            await prisma.$queryRaw`SELECT 1`;
+        } catch (err: any) {
+            console.warn('[DB Ping] Keep-alive ping failed:', err.message);
+        }
+    }, 3 * 60 * 1000);
 
-// Also run once on startup (with delay so server is fully ready)
-setTimeout(runJobs, 10_000);
+    // Also run once on startup (with delay so server is fully ready)
+    setTimeout(runJobs, 10_000);
+}
 
 export { runJobs };
