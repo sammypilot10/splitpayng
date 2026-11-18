@@ -2,7 +2,7 @@
  * Group D — escrow expiry (src/job/escrowExpiry.ts → processExpiredEscrows).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { prisma, resetDb, resetMocks, createUser, createHostWithPool } from './helpers/index.js';
+import { prisma, emailMocks, resetDb, resetMocks, createUser, createHostWithPool } from './helpers/index.js';
 import { createBarrier, createMembershipWithPayout, holdAfterRead, restorePrismaSpies, spyOnPrisma } from './helpers/concurrency.js';
 import { processExpiredEscrows } from '../src/job/escrowExpiry.js';
 
@@ -82,13 +82,42 @@ describe('Group D: escrow expiry', () => {
     const barrier = createBarrier(2);
     holdAfterRead(prisma.membership, 'findMany', barrier);
 
-    // Count payout transitions that actually happened.
-    const [updateManySpy, origUpdateMany] = spyOnPrisma(prisma.payout, 'updateMany');
-    const transitions: number[] = [];
-    updateManySpy.mockImplementation((async (args: any) => {
-      const r = await origUpdateMany.call(prisma.payout, args);
-      transitions.push(r.count);
-      return r;
+    // Observe tx.payout.updateMany counts through prisma.$transaction without mutating tx.
+    const [txSpy, origTx] = spyOnPrisma(prisma, '$transaction');
+    const payoutUpdateCounts: number[] = [];
+    txSpy.mockImplementation(((fnOrOps: any, ...rest: any[]) => {
+      if (typeof fnOrOps !== 'function') {
+        return (origTx as any).call(prisma, fnOrOps, ...rest);
+      }
+      return (origTx as any).call(
+        prisma,
+        async (tx: any) => {
+          const observedTx = new Proxy(tx, {
+            get(target, prop, receiver) {
+              if (prop === 'payout') {
+                const payoutDelegate = Reflect.get(target, prop, receiver);
+                return new Proxy(payoutDelegate, {
+                  get(pTarget, pProp, pReceiver) {
+                    const value = Reflect.get(pTarget, pProp, pReceiver);
+                    if (pProp === 'updateMany' && typeof value === 'function') {
+                      return async (...args: any[]) => {
+                        const r = await value.apply(pTarget, args);
+                        payoutUpdateCounts.push(r.count);
+                        return r;
+                      };
+                    }
+                    return typeof value === 'function' ? value.bind(pTarget) : value;
+                  },
+                });
+              }
+              const value = Reflect.get(target, prop, receiver);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          return fnOrOps(observedTx);
+        },
+        ...rest
+      );
     }) as any);
 
     await Promise.all([
@@ -97,13 +126,26 @@ describe('Group D: escrow expiry', () => {
     ]);
     expect(barrier.arrived).toBe(2);
 
-    expect(transitions.filter((c) => c === 1)).toHaveLength(1);
+    expect(payoutUpdateCounts).toEqual([1]);
     const m = await prisma.membership.findUnique({ where: { id: membership.id } });
     expect(m!.status).toBe('ACTIVE');
     const p = await prisma.payout.findUnique({ where: { id: payout.id } });
     expect(p!.status).toBe('SCHEDULED');
+    expect(p!.payoutDueAt).not.toBeNull();
+
+    // Follow-up run must leave status and payoutDueAt untouched.
+    await processExpiredEscrows();
+    const pAfter = await prisma.payout.findUnique({ where: { id: payout.id } });
+    expect(pAfter!.status).toBe('SCHEDULED');
+    expect(pAfter!.payoutDueAt).toEqual(p!.payoutDueAt);
+    expect(payoutUpdateCounts).toEqual([1]);
+
     expect(await prisma.payout.count()).toBe(1);
     expect(await prisma.notification.count()).toBe(0);
+    const totalEmailCalls = Object.values(emailMocks)
+      .filter((fn) => vi.isMockFunction(fn))
+      .reduce((sum, fn) => sum + (fn as any).mock.calls.length, 0);
+    expect(totalEmailCalls).toBe(0);
   });
 
   it('D4: membership with no successful transaction does not crash the loop', async () => {

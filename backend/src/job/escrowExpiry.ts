@@ -78,14 +78,20 @@ export async function processExpiredEscrows() {
         });
 
         for (const m of memberships) {
-            await prisma.membership.update({
-                where: { id: m.id },
-                data: { status: 'ACTIVE' },
-            });
+            await prisma.$transaction(async (tx) => {
+                const updated = await tx.membership.updateMany({
+                    where: { id: m.id, status: 'IN_ESCROW' },
+                    data: { status: 'ACTIVE' },
+                });
 
-            // Natural escrow period has already elapsed; payout is due immediately
-            const payoutDueAt = new Date();
-            await schedulePayoutForMembership(m.id, payoutDueAt);
+                if (updated.count !== 1) {
+                    return;
+                }
+
+                // Natural escrow period has already elapsed; payout is due immediately
+                const payoutDueAt = new Date();
+                await schedulePayoutForMembership(m.id, payoutDueAt, tx);
+            });
         }
 
         if (memberships.length > 0) {
