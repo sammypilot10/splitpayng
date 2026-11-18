@@ -417,16 +417,27 @@ async function processPayment(
   reference: string,
   providedPaystackData?: any
 ): Promise<{ success: boolean; message: string; type?: string }> {
-  const existingLog = await prisma.webhookLog.findUnique({ where: { reference } });
-  if (existingLog?.processed) {
-    return { success: true, message: 'Already processed' };
-  }
-
-  await prisma.webhookLog.upsert({
-    where: { reference },
-    update: {},
-    create: { reference, event: 'charge.success', processed: false },
+  const STALE_CLAIM_MS = 2 * 60 * 1000;
+  const now = new Date();
+  const claim = await prisma.webhookLog.createMany({
+    data: [{ reference, event: 'charge.success', processed: false, createdAt: now }],
+    skipDuplicates: true,
   });
+
+  if (claim.count === 0) {
+    const staleBefore = new Date(now.getTime() - STALE_CLAIM_MS);
+    const reclaimed = await prisma.webhookLog.updateMany({
+      where: {
+        reference,
+        processed: false,
+        createdAt: { lt: staleBefore },
+      },
+      data: { createdAt: now },
+    });
+    if (reclaimed.count === 0) {
+      return { success: true, message: 'Already processed' };
+    }
+  }
 
   const transaction = await prisma.transaction.findUnique({
     where: { reference },
@@ -434,6 +445,7 @@ async function processPayment(
   });
 
   if (!transaction) {
+    await prisma.webhookLog.deleteMany({ where: { reference, processed: false } });
     return { success: false, message: 'Transaction not found' };
   }
 
@@ -449,6 +461,7 @@ async function processPayment(
         where: { reference },
         data: { status: 'FAILED', paystackData: paystackData as any },
       });
+      await prisma.webhookLog.deleteMany({ where: { reference, processed: false } });
       return { success: false, message: 'Payment verification failed' };
     }
 
@@ -528,6 +541,7 @@ async function processPayment(
     const userId = transaction.userId;
 
     if (!poolId) {
+      await prisma.webhookLog.deleteMany({ where: { reference, processed: false } });
       return { success: false, message: 'Missing pool ID' };
     }
 
@@ -537,6 +551,7 @@ async function processPayment(
     });
 
     if (!pool) {
+      await prisma.webhookLog.deleteMany({ where: { reference, processed: false } });
       return { success: false, message: 'Pool not found' };
     }
 
@@ -774,6 +789,9 @@ async function processPayment(
     const currentTx = await prisma.transaction.findUnique({ where: { reference } });
     if (currentTx && currentTx.status !== 'SUCCESS') {
       await prisma.transaction.update({ where: { reference }, data: { status: 'FAILED' } });
+    }
+    if (!currentTx || currentTx.status !== 'SUCCESS') {
+      await prisma.webhookLog.deleteMany({ where: { reference, processed: false } }).catch(() => { });
     }
     return { success: false, message: error.message || 'Processing failed' };
   }
