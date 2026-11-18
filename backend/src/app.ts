@@ -23,6 +23,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const isDev = process.env.NODE_ENV !== 'production';
 
+// Trust configured number of reverse-proxy hops so req.ip and rate limiting use the forwarded client IP
+const parsedTrustProxy = Number.parseInt(process.env.TRUST_PROXY ?? '1', 10);
+const trustProxyHops = Number.isNaN(parsedTrustProxy) || parsedTrustProxy < 0 ? 1 : parsedTrustProxy;
+app.set('trust proxy', trustProxyHops);
+
 app.use(cors({
     origin: [
         'http://localhost:5173',
