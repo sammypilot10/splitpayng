@@ -5,6 +5,7 @@ import {
     processScheduledPayouts,
     processRecurringBilling,
     reconcilePendingTransfers,
+    reconcilePendingRecurringCharges,
 } from './escrowExpiry.js';
 import { pruneOldNotifications } from '../utils/notifications.js';
 import { prisma } from '../db.js';
@@ -55,6 +56,12 @@ async function runJobs() {
         await reconcilePendingTransfers();
     } catch (err: any) {
         console.error('[Cron] Reconcile pending transfers job failed:', err.message);
+    }
+
+    try {
+        await reconcilePendingRecurringCharges();
+    } catch (err: any) {
+        console.error('[Cron] Reconcile pending recurring charges job failed:', err.message);
     }
 
     // Daily notification retention pruning

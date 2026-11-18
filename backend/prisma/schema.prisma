@@ -122,6 +122,8 @@ model Membership {
   escrowEndsAt    DateTime?
   nextBillingDate DateTime?
   paystackAuthCode String?
+  billingAttempts   Int              @default(0)
+  billingCycleDate  DateTime?
 
   user            User             @relation(fields: [userId], references: [id])
   pool            Pool             @relation(fields: [poolId], references: [id])

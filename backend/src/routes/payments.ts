@@ -7,7 +7,7 @@ import { initializeTransaction, verifyTransaction, chargeAuthorization, refundTr
 import { recalculateHostReputation } from '../utils/reputation.js';
 import { sendPaymentSuccessEmail, sendPoolFilledEmail, sendNewMemberEmail } from '../utils/email.js';
 import { createNotification } from '../utils/notifications.js';
-import { completePayout } from '../utils/transactions.js';
+import { completePayout, completeRecurringCharge } from '../utils/transactions.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -508,44 +508,18 @@ async function processPayment(
 
     // ─── RECURRING BILLING FLOW ───────────────────────────────────────────
     if (transaction.type === 'RECURRING') {
-      await prisma.transaction.update({
-        where: { reference },
-        data: {
-          status: 'SUCCESS',
-          paystackData: paystackData as any,
-        },
-      });
-
-      if (transaction.membershipId) {
-        const nextBillingDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        await prisma.membership.update({
-          where: { id: transaction.membershipId },
-          data: { nextBillingDate },
-        });
-
-        const membership = await prisma.membership.findUnique({
-          where: { id: transaction.membershipId },
-          include: { pool: true },
-        });
-
-        if (membership) {
-          const payoutDueAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
-          await prisma.payout.upsert({
-            where: { transactionId: transaction.id },
-            update: {},
-            create: {
-              transactionId: transaction.id,
-              hostId: membership.pool.hostId,
-              amount: transaction.hostPayout,
-              status: 'SCHEDULED',
-              payoutDueAt,
-            },
-          });
-        }
-      }
+      const result = await completeRecurringCharge(reference, paystackData);
 
       await prisma.webhookLog.update({ where: { reference }, data: { processed: true } });
-      return { success: true, message: 'Recurring subscription renewal processed', type: transaction.type };
+      return {
+        success: true,
+        message: result.completed
+          ? 'Recurring subscription renewal processed'
+          : result.reason === 'inactive_refund_pending'
+            ? 'Charge completed but membership not active — refund pending'
+            : 'Already processed',
+        type: transaction.type,
+      };
     }
 
     // ─── POOL JOIN FLOW ───────────────────────────────────────────────────

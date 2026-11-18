@@ -4,6 +4,7 @@ import {
     initiateTransfer,
     chargeAuthorization,
     verifyTransfer,
+    verifyTransaction,
     classifyPaystackError,
 } from '../utils/paystack.js';
 import {
@@ -13,7 +14,16 @@ import {
     sendPaymentFailedEmail,
 } from '../utils/email.js';
 import { createNotification } from '../utils/notifications.js';
-import { schedulePayoutForMembership, completePayout } from '../utils/transactions.js';
+import {
+    schedulePayoutForMembership,
+    completePayout,
+    completeRecurringCharge,
+    failRecurringCharge,
+    failNoPaymentMethod,
+    resolveBillingAuthorization,
+    buildRecurringReference,
+    MAX_BILLING_ATTEMPTS,
+} from '../utils/transactions.js';
 
 const PLATFORM_FEE_PERCENT = 0.20;
 export const loggedOtpPayoutIds = new Set<string>();
@@ -461,6 +471,7 @@ export async function processRecurringBilling() {
         const memberships = await prisma.membership.findMany({
             where: {
                 status: 'ACTIVE',
+                billingAttempts: { lt: MAX_BILLING_ATTEMPTS },
                 nextBillingDate: { lte: now },
             },
             include: {
@@ -477,121 +488,173 @@ export async function processRecurringBilling() {
         });
 
         for (const m of memberships) {
-            // FIX #13: Skip if billing date is in the future (not due yet)
-            if (m.nextBillingDate && m.nextBillingDate.getTime() > now.getTime()) {
-                continue;
-            }
-
-            const recentFailures = await prisma.transaction.count({
-                where: {
-                    membershipId: m.id,
-                    type: 'RECURRING',
-                    status: 'FAILED',
-                    createdAt: { gte: new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000) },
-                },
-            });
-
-            if (recentFailures >= 3) {
-                await prisma.membership.update({
-                    where: { id: m.id },
-                    data: { status: 'FAILED' },
-                });
-                console.error(`[Recurring] Membership ${m.id} cancelled after 3 failed billing attempts`);
-                continue;
-            }
-
-            // Retrieve card authorization (membership specific or user default)
-            const authCode = m.paystackAuthCode || m.user.paymentMethods[0]?.authorizationCode;
-
-            if (!authCode) {
-                await sendPaymentFailedEmail(
-                    m.user.email,
-                    m.user.fullName,
-                    m.pool.name,
-                    m.pool.pricePerSeat
-                );
-                await createNotification({
-                    userId: m.userId,
-                    type: 'PAYMENT_FAILED',
-                    title: 'Renewal payment failed',
-                    message: `Automatic renewal for "${m.pool.name}" failed: No payment card on file. Please add a debit card in your settings to avoid losing access.`,
-                    data: { poolId: m.pool.id, membershipId: m.id },
-                });
-                continue;
-            }
-
-            const reference = `SP-RECUR-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-            const amount = m.pool.pricePerSeat;
-            const platformFee = Math.floor(amount * PLATFORM_FEE_PERCENT);
-            const hostPayout = amount - platformFee;
-
             try {
-                const transaction = await prisma.transaction.create({
-                    data: {
-                        userId: m.userId,
-                        membershipId: m.id,
-                        reference,
-                        amount,
-                        platformFee,
-                        hostPayout,
-                        status: 'PENDING',
-                        type: 'RECURRING',
-                    },
-                });
+                // Resolve card authorization
+                const authCode = resolveBillingAuthorization(m);
 
-                const paystackData = await chargeAuthorization(
-                    authCode,
-                    m.user.email,
-                    amount,
-                    reference,
-                    { membershipId: m.id, poolId: m.pool.id, type: 'RECURRING' }
-                );
+                if (!authCode) {
+                    const noCardResult = await failNoPaymentMethod(m.id);
+                    if (noCardResult.failed) {
+                        try {
+                            await sendPaymentFailedEmail(
+                                m.user.email,
+                                m.user.fullName,
+                                m.pool.name,
+                                m.pool.pricePerSeat,
+                            );
+                            await createNotification({
+                                userId: m.userId,
+                                type: 'PAYMENT_FAILED',
+                                title: 'Renewal payment failed',
+                                message: `Automatic renewal for "${m.pool.name}" failed: No payment card on file. ${noCardResult.finalFailure ? 'Your membership status is now FAILED.' : 'Please add a debit card in your settings to avoid losing access.'}`,
+                                data: { poolId: m.pool.id, membershipId: m.id },
+                            });
+                        } catch (notifyErr: any) {
+                            console.error(`[Recurring] Notification error for ${m.id}:`, notifyErr.message);
+                        }
 
-                if (paystackData.status === 'success') {
-                    await prisma.transaction.update({
-                        where: { id: transaction.id },
-                        data: {
-                            status: 'SUCCESS',
-                            paystackData: paystackData as any,
-                        },
-                    });
-
-                    const nextBillingDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-                    await prisma.membership.update({
-                        where: { id: m.id },
-                        data: { nextBillingDate },
-                    });
-
-                    const payoutDueAt = new Date(now.getTime() + 48 * 60 * 60 * 1000);
-                    await prisma.payout.create({
-                        data: {
-                            transactionId: transaction.id,
-                            hostId: m.pool.hostId,
-                            amount: hostPayout,
-                            status: 'SCHEDULED',
-                            payoutDueAt,
-                        },
-                    });
-
-                    console.log(`[Recurring] Charged ${m.user.email} ₦${amount} for ${m.pool.name}`);
-                } else {
-                    await prisma.transaction.update({
-                        where: { id: transaction.id },
-                        data: { status: 'FAILED', paystackData: paystackData as any },
-                    });
-                    console.error(`[Recurring] Failed to charge ${m.user.email}: ${paystackData.message}`);
-
-                    await sendPaymentFailedEmail(m.user.email, m.user.fullName, m.pool.name, amount);
-                    await createNotification({
-                        userId: m.userId,
-                        type: 'PAYMENT_FAILED',
-                        title: 'Subscription renewal failed',
-                        message: `Payment of ₦${amount.toLocaleString()} for "${m.pool.name}" failed: ${paystackData.message || 'Card declined'}. Please update your payment method to maintain access.`,
-                        data: { membershipId: m.id, poolId: m.poolId },
-                    });
+                        if (noCardResult.finalFailure) {
+                            try {
+                                await createNotification({
+                                    userId: m.pool.hostId,
+                                    type: 'MEMBER_BILLING_FAILED',
+                                    title: 'Member billing failed',
+                                    message: `Billing for a member in "${m.pool.name}" failed after ${MAX_BILLING_ATTEMPTS} attempts due to no payment card on file. The membership status is now FAILED.`,
+                                    data: { membershipId: m.id, poolId: m.poolId },
+                                });
+                            } catch (hostNotifyErr: any) {
+                                console.error(`[Recurring] Host notification error for ${m.id}:`, hostNotifyErr.message);
+                            }
+                        }
+                    }
+                    continue;
                 }
-            } catch (err: any) {
-                console.error(`[Recurring] Error charging ${m.user.email}:`, err.message);
+
+                // Deterministic reference: REC-{membershipId}-{yyyymmdd(cycleDate)}-{attemptNo}
+                const cycleDate = m.billingCycleDate ?? m.nextBillingDate!;
+                const attemptNo = m.billingAttempts + 1;
+                const reference = buildRecurringReference(m.id, cycleDate, attemptNo);
+
+                const amount = m.pool.pricePerSeat;
+                const platformFee = Math.floor(amount * PLATFORM_FEE_PERCENT);
+                const hostPayout = amount - platformFee;
+
+                // Claim the attempt slot — P2002 on unique reference = concurrent cron, skip
+                try {
+                    await prisma.transaction.create({
+                        data: {
+                            userId: m.userId,
+                            membershipId: m.id,
+                            reference,
+                            amount,
+                            platformFee,
+                            hostPayout,
+                            status: 'PENDING',
+                            type: 'RECURRING',
+                        },
+                    });
+                } catch (err: any) {
+                    if (err.code === 'P2002') {
+                        console.log(`[Recurring] Reference ${reference} already claimed, skipping`);
+                        continue;
+                    }
+                    throw err;
+                }
+
+                try {
+                    const paystackData = await chargeAuthorization(
+                        authCode,
+                        m.user.email,
+                        amount,
+                        reference,
+                        { membershipId: m.id, poolId: m.pool.id, type: 'RECURRING' }
+                    );
+
+                    if (paystackData.status === 'success') {
+                        await completeRecurringCharge(reference, paystackData);
+                        console.log(`[Recurring] Charged ${m.user.email} ₦${amount} for ${m.pool.name}`);
+                    } else if (['pending', 'send_pin', 'ongoing'].includes(paystackData.status)) {
+                        // Paystack is still processing — leave PENDING
+                        console.log(`[Recurring] Charge for ${reference} is '${paystackData.status}'. Leaving PENDING.`);
+                    } else {
+                        // Declined
+                        const reason = paystackData.gateway_response || paystackData.message || 'Card declined';
+                        const result = await failRecurringCharge(reference, reason, paystackData);
+
+                        if (result.failed) {
+                            // Notify member on every decline
+                            try {
+                                await sendPaymentFailedEmail(m.user.email, m.user.fullName, m.pool.name, amount);
+                                await createNotification({
+                                    userId: m.userId,
+                                    type: 'PAYMENT_FAILED',
+                                    title: 'Subscription renewal failed',
+                                    message: `Payment of ₦${amount.toLocaleString()} for "${m.pool.name}" failed: ${reason}. ${result.finalFailure ? 'Your membership status is now FAILED.' : 'We will retry automatically.'}`,
+                                    data: { membershipId: m.id, poolId: m.poolId },
+                                });
+                            } catch (notifyErr: any) {
+                                console.error(`[Recurring] Member notification error for ${reference}:`, notifyErr.message);
+                            }
+
+                            if (result.finalFailure) {
+                                // Notify host (side effect after commit, wrapped safely)
+                                try {
+                                    await createNotification({
+                                        userId: m.pool.hostId,
+                                        type: 'MEMBER_BILLING_FAILED',
+                                        title: 'Member billing failed',
+                                        message: `Billing for a member in "${m.pool.name}" failed after ${MAX_BILLING_ATTEMPTS} attempts. The membership status is now FAILED.`,
+                                        data: { membershipId: m.id, poolId: m.poolId },
+                                    });
+                                } catch (hostNotifyErr: any) {
+                                    console.error(`[Recurring] Host notification error for ${reference}:`, hostNotifyErr.message);
+                                }
+                            }
+                        }
+                    }
+                } catch (err: any) {
+                    const classification = classifyPaystackError(err);
+                    if (classification === 'PERMANENT') {
+                        // Definite 4xx (invalid or expired authorization, etc.) — count as decline!
+                        const reason = err.message || 'Payment card authorization failed';
+                        const result = await failRecurringCharge(reference, reason, err.data);
+
+                        if (result.failed) {
+                            try {
+                                await sendPaymentFailedEmail(m.user.email, m.user.fullName, m.pool.name, amount);
+                                await createNotification({
+                                    userId: m.userId,
+                                    type: 'PAYMENT_FAILED',
+                                    title: 'Subscription renewal failed',
+                                    message: `Payment of ₦${amount.toLocaleString()} for "${m.pool.name}" failed: ${reason}. ${result.finalFailure ? 'Your membership status is now FAILED.' : 'We will retry automatically.'}`,
+                                    data: { membershipId: m.id, poolId: m.poolId },
+                                });
+                            } catch (notifyErr: any) {
+                                console.error(`[Recurring] Member notification error for ${reference}:`, notifyErr.message);
+                            }
+
+                            if (result.finalFailure) {
+                                try {
+                                    await createNotification({
+                                        userId: m.pool.hostId,
+                                        type: 'MEMBER_BILLING_FAILED',
+                                        title: 'Member billing failed',
+                                        message: `Billing for a member in "${m.pool.name}" failed after ${MAX_BILLING_ATTEMPTS} attempts. The membership status is now FAILED.`,
+                                        data: { membershipId: m.id, poolId: m.poolId },
+                                    });
+                                } catch (hostNotifyErr: any) {
+                                    console.error(`[Recurring] Host notification error for ${reference}:`, hostNotifyErr.message);
+                                }
+                            }
+                        }
+                    } else {
+                        // Network/Paystack transient error (5xx, timeout) — leave PENDING for reconcile
+                        console.error(`[Recurring] Transient/possibly-created error charging ${m.user.email} (${classification}):`, err.message);
+                    }
+                }
+            } catch (loopErr: any) {
+                // Per-membership error isolation: one failure does not halt the loop
+                console.error(`[Recurring] Unexpected error processing membership ${m.id}:`, loopErr.message);
             }
         }
 
@@ -599,4 +662,96 @@ export async function processRecurringBilling() {
             console.log(`[Cron] Processed ${memberships.length} recurring billing items`);
         }
     }, 'Recurring billing');
+}
+
+/**
+ * Reconciles RECURRING transactions stuck in PENDING for over 15 minutes.
+ * - Verify success on Paystack → completeRecurringCharge
+ * - Verify failed → failRecurringCharge
+ * - Verify 404 → delete PENDING transaction (free the reference slot for retry)
+ * - Verify network error → leave PENDING
+ */
+export async function reconcilePendingRecurringCharges() {
+    await withRetry(async () => {
+        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+
+        const pendingTransactions = await prisma.transaction.findMany({
+            where: {
+                type: 'RECURRING',
+                status: 'PENDING',
+                createdAt: { lte: fifteenMinutesAgo },
+            },
+            include: {
+                membership: {
+                    include: {
+                        pool: true,
+                        user: { select: { email: true, fullName: true } },
+                    },
+                },
+            },
+        });
+
+        for (const txn of pendingTransactions) {
+            try {
+                const paystackData = await verifyTransaction(txn.reference);
+                const status = (paystackData?.status || '').toLowerCase();
+
+                if (status === 'success') {
+                    await completeRecurringCharge(txn.reference, paystackData);
+                    console.log(`[Reconcile] Recurring charge ${txn.reference} verified as success.`);
+                } else if (status === 'failed') {
+                    const reason = paystackData?.gateway_response || 'Card declined (verified by reconciliation)';
+                    const result = await failRecurringCharge(txn.reference, reason, paystackData);
+
+                    if (result.failed && txn.membership) {
+                        // Notify member on decline (side effects wrapped safely)
+                        try {
+                            await sendPaymentFailedEmail(
+                                txn.membership.user.email,
+                                txn.membership.user.fullName,
+                                txn.membership.pool.name,
+                                txn.amount,
+                            );
+                            await createNotification({
+                                userId: txn.membership.userId,
+                                type: 'PAYMENT_FAILED',
+                                title: 'Subscription renewal failed',
+                                message: `Payment of ₦${txn.amount.toLocaleString()} for "${txn.membership.pool.name}" failed: ${reason}.`,
+                                data: { membershipId: txn.membership.id, poolId: txn.membership.poolId },
+                            });
+
+                            if (result.finalFailure) {
+                                await createNotification({
+                                    userId: txn.membership.pool.hostId,
+                                    type: 'MEMBER_BILLING_FAILED',
+                                    title: 'Member billing failed',
+                                    message: `Billing for a member in "${txn.membership.pool.name}" failed after ${MAX_BILLING_ATTEMPTS} attempts. The membership has been cancelled.`,
+                                    data: { membershipId: txn.membership.id, poolId: txn.membership.poolId },
+                                });
+                            }
+                        } catch (notifyErr: any) {
+                            console.error(`[Reconcile] Notification error for ${txn.reference}:`, notifyErr.message);
+                        }
+                    }
+                } else if (['pending', 'send_pin', 'ongoing'].includes(status)) {
+                    console.log(`[Reconcile] Recurring charge ${txn.reference} is '${status}'. Leaving PENDING.`);
+                }
+            } catch (err: any) {
+                if (err.status === 404 || err.message?.toLowerCase().includes('not found')) {
+                    // Verify 404: delete the PENDING transaction to free the reference slot
+                    console.warn(`[Reconcile] Recurring charge ${txn.reference} not found on Paystack (404). Deleting PENDING transaction to free reference slot.`);
+                    await prisma.transaction.deleteMany({
+                        where: { id: txn.id, status: 'PENDING' },
+                    });
+                } else {
+                    // Network error — leave PENDING
+                    console.warn(`[Reconcile] Error verifying recurring charge ${txn.reference}: ${err.message}. Leaving PENDING.`);
+                }
+            }
+        }
+
+        if (pendingTransactions.length > 0) {
+            console.log(`[Cron] Reconciled ${pendingTransactions.length} pending recurring charges`);
+        }
+    }, 'Reconcile pending recurring charges');
 }
