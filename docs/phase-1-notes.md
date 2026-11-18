@@ -1,6 +1,6 @@
 # Phase 1 Fixes Notes
 
-Branch: `phase-1-fixes` — Final suite result: **73 passed | 1 todo (74)** across 12 test files (baseline 63 passing + 7 fixes + 3 new stale-claim tests; F7 remains `todo`).
+Branch: `phase-1-fixes` — Final suite result: **74 passed | 1 todo (75)** across 13 test files (baseline 63 passing + 7 fixes + 3 stale-claim tests + 1 upload-headers test; F7 remains `todo`).
 
 ## C2 & C1 — Concurrent webhook / verify race (`processPayment`)
 - **Root cause:** `processPayment` checked `webhookLog.processed` and ran `webhookLog.upsert({ update: {} })` non-atomically, causing concurrent deliveries of the same reference to throw `P2002` (HTTP 500) or execute duplicate emails and notifications.
@@ -33,7 +33,15 @@ Branch: `phase-1-fixes` — Final suite result: **73 passed | 1 todo (74)** acro
 - **Not changed:** `tests/I-infrastructure.test.ts` untouched.
 
 ## H5 — Authenticated users can read other users' uploaded files
-- **Root cause:** `GET /api/uploads/:path(*)` checked authentication and path containment, but performed no ownership or dispute-party authorization check.
-- **Fix:** Audited all uploads (`DisputeEvidence` is the sole upload entity), tightened path containment with `path.relative`, allowed `ADMIN` directly, and required non-admins to match `DisputeEvidence` (`uploadedBy`, `dispute.memberId`, `dispute.membership.userId`, or `dispute.membership.pool.hostId`), returning `403` before `fs.existsSync` on mismatch or unmapped files.
-- **Files changed:** `backend/src/routes/uploads.ts`
-- **Not changed:** No schema changes; `Content-Disposition` header on `res.sendFile` was not added yet (flagged for decision), and PDF is not currently in `upload.ts`'s image-only allowlist (PNG/JPG/GIF/WEBP).
+- **Root cause:** `GET /api/uploads/:path(*)` checked authentication and path containment, but performed no ownership or dispute-party authorization check, and served files without strict response security headers.
+- **Fix:** Audited all uploads (`DisputeEvidence` is the sole upload entity), tightened path containment with `path.relative`, allowed `ADMIN` directly, and required non-admins to match `DisputeEvidence` (`uploadedBy`, `dispute.memberId`, `dispute.membership.userId`, or `dispute.membership.pool.hostId`), returning `403` before `fs.existsSync` on mismatch or unmapped files. Also set explicit response headers on served files: allowlisted `Content-Type` (rejecting unsupported extensions with `403`), `Content-Disposition: inline; filename="<sanitized>"`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, no-store`, and `Content-Security-Policy: default-src 'none'; sandbox` (without adding `Cross-Origin-Resource-Policy`). Added `H-uploads-headers.test.ts`.
+- **Files changed:** `backend/src/routes/uploads.ts`, `backend/tests/H-uploads-headers.test.ts`
+- **Not changed:** No schema changes; `upload.ts` image-only allowlist (PNG/JPG/GIF/WEBP) kept without PDF support.
+
+## Not done / later
+- **PDF upload support:** Intentionally omitted; uploads remain restricted to PNG, JPG/JPEG, GIF, and WEBP images.
+- **E3 & F3 crash-window tests are approximate:** As documented in `docs/open-questions.md` (§§2–3), E3's `prisma.payout.update` fault-injection spy is never reached on current code (because payout claim now happens before `initiateTransfer`), and F3 injects its fault on `prisma.$transaction` rather than individual `tx.*` interactive-transaction delegates.
+- **F7 (`test.todo`):** Recurring renewals currently schedule `cycleDate + 30 days` rather than honouring `Pool.renewalDay`.
+- **Route shadowing (`GET /api/pools/dashboard-stats`):** Still shadowed by `GET /api/pools/:id` in `backend/src/routes/pools.ts` (noted in `docs/test-plan.md` H1; out of Phase 1 scope).
+- **Orphaned disk files on failed evidence upload:** If `POST /api/memberships/:id/dispute/evidence` rejects a request with 403/404 after `multer` writes to disk, the file is not unlinked (non-admins are blocked by default-deny on `/api/uploads`, but disk cleanup is deferred).
+- **Duplicate payment by active member (B3):** Paying again for an already `ACTIVE`/`IN_ESCROW` membership updates the membership without auto-refunding the duplicate charge (documented in `docs/test-plan.md` B3).

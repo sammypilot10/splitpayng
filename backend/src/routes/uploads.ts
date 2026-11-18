@@ -11,6 +11,19 @@ const __dirname = path.dirname(__filename);
 
 const router = Router();
 
+const ALLOWED_CONTENT_TYPES: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+};
+
+function sanitizeFilename(filePath: string, ext: string): string {
+    const base = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
+    return base && !base.startsWith('.') ? base : `evidence${ext}`;
+}
+
 router.get('/:path(*)', authMiddleware, async (req: AuthenticatedRequest, res, next) => {
     try {
         if (!req.user) {
@@ -62,12 +75,26 @@ router.get('/:path(*)', authMiddleware, async (req: AuthenticatedRequest, res, n
             }
         }
 
+        const ext = path.extname(resolvedPath).toLowerCase();
+        const contentType = ALLOWED_CONTENT_TYPES[ext];
+        if (!contentType) {
+            res.status(403).json({ success: false, message: 'Unsupported file type' });
+            return;
+        }
+
         if (!fs.existsSync(resolvedPath)) {
             res.status(404).json({ success: false, message: 'File not found' });
             return;
         }
 
-        res.sendFile(resolvedPath);
+        const safeFileName = sanitizeFilename(resolvedPath, ext);
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `inline; filename="${safeFileName}"`);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+
+        res.sendFile(resolvedPath, { cacheControl: false });
     } catch (error) {
         next(error);
     }
