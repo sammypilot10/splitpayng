@@ -7,10 +7,6 @@ process.env.PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_sp
 process.env.FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 process.env.RESEND_API_KEY = process.env.RESEND_API_KEY || 're_test_mock_key';
 
-if (!process.env.DATABASE_URL || process.env.DATABASE_URL.endsWith('/splitpayng?schema=public') || process.env.DATABASE_URL.endsWith('/splitpayng')) {
-  process.env.DATABASE_URL = 'postgresql://postgres:postgres@localhost:5433/splitpayng_test?connection_limit=20';
-}
-
 // Mock paystack utility
 vi.mock('../../src/utils/paystack.js', async (importOriginal) => {
   const actual: any = await importOriginal();
