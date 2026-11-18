@@ -192,59 +192,90 @@ describe('Group F: recurring billing', () => {
     });
   });
 
-  // EXPECTED-FAIL: working tree uses MAX_BILLING_ATTEMPTS = 4 (per-cycle counter),
-  // not "3 FAILED recurring transactions in 90 days".
-  it('F5: 3 FAILED recurring transactions in 90 days -> membership FAILED and not charged again', async () => {
-    // Two prior declines in the current cycle, recorded exactly as the job records them.
-    const cycleDate = new Date(Date.now() - 4 * DAY);
-    const { membership, pool } = await createDueRecurringMembership({ billingAttempts: 2 });
-    await prisma.membership.update({ where: { id: membership.id }, data: { billingCycleDate: cycleDate } });
-    const yyyymmdd = cycleDate.toISOString().slice(0, 10).replace(/-/g, '');
-    for (const attempt of [1, 2]) {
-      await prisma.transaction.create({
-        data: {
-          userId: membership.userId,
-          membershipId: membership.id,
-          reference: `REC-${membership.id}-${yyyymmdd}-${attempt}`,
-          amount: pool.pricePerSeat,
-          platformFee: Math.floor(pool.pricePerSeat * 0.2),
-          hostPayout: pool.pricePerSeat - Math.floor(pool.pricePerSeat * 0.2),
-          status: 'FAILED',
-          type: 'RECURRING',
-          createdAt: new Date(Date.now() - (4 - attempt) * DAY),
-        },
-      });
-    }
+  it('F5 per-cycle dunning: 3 declines retry after delay, 4th fails membership & reopens pool, success resets billingAttempts', async () => {
+    // (a) & (b): 1-seat FULL pool so we can verify pool reopening on final (4th) failure.
+    const { membership, pool } = await createDueRecurringMembership({ totalSeats: 1 });
+    await prisma.pool.update({ where: { id: pool.id }, data: { status: 'FULL' } });
 
-    // Every charge attempt is declined.
     const charge = vi.mocked(paystackMocks.chargeAuthorization);
-    charge.mockImplementation(async (_a: any, _e: any, amount: any, reference: any) => ({
+    const defaultCharge = charge.getMockImplementation();
+    expect(defaultCharge).toBeTypeOf('function');
+    const mockDecline = async (_a: any, _e: any, amount: any, reference: any) => ({
       status: 'failed',
       reference,
       amount: amount * 100,
       gateway_response: 'Declined',
-    }));
+    });
+    charge.mockImplementation(mockDecline as any);
 
-    // Run 1: third decline within 90 days.
+    const expectedRetryDelaysDays = [1, 3, 5];
+
+    // Attempts 1, 2, 3: membership stays ACTIVE, retries scheduled after [1, 3, 5] days.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const before = Date.now();
+      await processRecurringBilling();
+      const after = Date.now();
+
+      expect(charge).toHaveBeenCalledTimes(attempt);
+
+      const m = await prisma.membership.findUniqueOrThrow({ where: { id: membership.id } });
+      expect(m.status).toBe('ACTIVE');
+      expect(m.billingAttempts).toBe(attempt);
+      expect(m.billingCycleDate).not.toBeNull();
+
+      const delayMs = expectedRetryDelaysDays[attempt - 1] * DAY;
+      expect(m.nextBillingDate!.getTime()).toBeGreaterThanOrEqual(before + delayMs - 5000);
+      expect(m.nextBillingDate!.getTime()).toBeLessThanOrEqual(after + delayMs + 5000);
+
+      // Running again BEFORE the retry delay elapses must not charge.
+      await processRecurringBilling();
+      expect(charge).toHaveBeenCalledTimes(attempt);
+
+      // Advance past the retry delay so the next run is due.
+      await prisma.membership.update({
+        where: { id: membership.id },
+        data: { nextBillingDate: new Date(Date.now() - HOUR) },
+      });
+    }
+
+    // Pool is still FULL after 3 declines.
+    expect((await prisma.pool.findUniqueOrThrow({ where: { id: pool.id } })).status).toBe('FULL');
+
+    // Attempt 4 (terminal): membership becomes FAILED, pool reopens to ACTIVE.
     await processRecurringBilling();
-    expect(charge).toHaveBeenCalledTimes(1);
-    expect(
-      await prisma.transaction.count({
-        where: { membershipId: membership.id, type: 'RECURRING', status: 'FAILED', createdAt: { gte: new Date(Date.now() - 90 * DAY) } },
-      })
-    ).toBe(3);
+    expect(charge).toHaveBeenCalledTimes(4);
 
-    // Time passes; whatever retry date was set is now due. Run 2 must not charge.
-    await prisma.membership.updateMany({
-      where: { id: membership.id, nextBillingDate: { not: null } },
+    const failedMembership = await prisma.membership.findUniqueOrThrow({ where: { id: membership.id } });
+    expect(failedMembership.status).toBe('FAILED');
+    expect(failedMembership.billingAttempts).toBe(4);
+    expect((await prisma.pool.findUniqueOrThrow({ where: { id: pool.id } })).status).toBe('ACTIVE');
+
+    // A further run (even if nextBillingDate is in the past) must make no charge.
+    await prisma.membership.update({
+      where: { id: membership.id },
       data: { nextBillingDate: new Date(Date.now() - HOUR) },
     });
     await processRecurringBilling();
+    expect(charge).toHaveBeenCalledTimes(4);
 
-    expect({
-      chargeAttempts: charge.mock.calls.length,
-      membershipStatus: (await prisma.membership.findUniqueOrThrow({ where: { id: membership.id } })).status,
-    }).toEqual({ chargeAttempts: 1, membershipStatus: 'FAILED' });
+    // (c) A successful renewal after prior failed attempts resets billingAttempts to 0.
+    const second = await createDueRecurringMembership();
+    await processRecurringBilling();
+    const afterOneDecline = await prisma.membership.findUniqueOrThrow({ where: { id: second.membership.id } });
+    expect(afterOneDecline.billingAttempts).toBe(1);
+    expect(afterOneDecline.billingCycleDate).not.toBeNull();
+
+    await prisma.membership.update({
+      where: { id: second.membership.id },
+      data: { nextBillingDate: new Date(Date.now() - HOUR) },
+    });
+    charge.mockImplementation(defaultCharge! as any);
+    await processRecurringBilling();
+
+    const afterSuccess = await prisma.membership.findUniqueOrThrow({ where: { id: second.membership.id } });
+    expect(afterSuccess.status).toBe('ACTIVE');
+    expect(afterSuccess.billingAttempts).toBe(0);
+    expect(afterSuccess.billingCycleDate).toBeNull();
   });
 
   it('F6: no card on file -> payment-failed email + notification, no charge attempted', async () => {

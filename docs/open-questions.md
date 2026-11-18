@@ -88,3 +88,5 @@ The plan says "3 FAILED recurring transactions in 90 days". The code uses a per-
 plus a third decline in the run, then time passes and the job runs again. The test does not care
 whether a fix checks the rule when a failure is recorded or when billing runs. **Product decision
 needed:** should a success in between reset the 90-day window?
+
+**Resolved:** F5 test described an old rule; replaced with per-cycle dunning test (`MAX_BILLING_ATTEMPTS = 4`, retry delays `[1, 3, 5]` days, pool reopened on 4th failure, `billingAttempts` reset to `0` on successful renewal).
