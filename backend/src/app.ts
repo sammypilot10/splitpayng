@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { prisma } from './db.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import authRoutes from './routes/auth.js';
 import poolRoutes from './routes/pools.js';
@@ -98,8 +99,24 @@ app.use(express.json({
   },
 }));
 
-app.get('/api/health', (_req, res) => {
-    res.json({ success: true, message: 'SplitPayNG API is running' });
+const parsedHealthTimeout = Number.parseInt(process.env.HEALTH_DB_TIMEOUT_MS ?? '5000', 10);
+const healthDbTimeoutMs = Number.isNaN(parsedHealthTimeout) || parsedHealthTimeout <= 0 ? 5000 : parsedHealthTimeout;
+
+app.get('/api/health', async (_req, res) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const query = prisma.$queryRaw`SELECT 1`;
+        query.catch(() => undefined);
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Database health check timed out')), healthDbTimeoutMs);
+        });
+        await Promise.race([query, timeout]);
+        res.json({ success: true, message: 'SplitPayNG API is running' });
+    } catch {
+        res.status(503).json({ success: false, message: 'Database unavailable' });
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 });
 
 app.use('/api/auth', authLimiter, authRoutes);
